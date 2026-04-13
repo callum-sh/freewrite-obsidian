@@ -1,4 +1,11 @@
-# hi, this is freewrite
+# freewrite-obsidian
+
+fork of [freewrite](https://github.com/farzaa/freewrite) with Obsidian vault integration.
+
+- **Obsidian-compatible output** -- entries are saved as `yyyy-MM-dd-title.md` with YAML frontmatter (`title`, `date`, `type: journal`), so they show up natively in Obsidian.
+- **User-selectable journal directory** -- click "History" to pick any folder (e.g. your vault's `raw/journal/`). The choice persists across launches.
+
+---
 
 a simple, open-source mac app to freewrite.
 
