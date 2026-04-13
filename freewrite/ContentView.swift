@@ -19,17 +19,26 @@ enum EntryType {
 struct HumanEntry: Identifiable {
     let id: UUID
     let date: String
-    let filename: String
+    var filename: String
     var previewText: String
     var entryType: EntryType
     var videoFilename: String?
 
-    static func createNew() -> HumanEntry {
+    static func createNew(in directory: URL) -> HumanEntry {
         let id = UUID()
         let now = Date()
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "yyyy-MM-dd"
         let dateString = dateFormatter.string(from: now)
+
+        // Avoid filename collisions for multiple entries on the same day
+        var filename = "\(dateString).md"
+        var counter = 2
+        while FileManager.default.fileExists(atPath: directory.appendingPathComponent(filename).path) {
+            filename = "\(dateString)-\(counter).md"
+            counter += 1
+        }
 
         // For display
         dateFormatter.dateFormat = "MMM d"
@@ -38,33 +47,39 @@ struct HumanEntry: Identifiable {
         return HumanEntry(
             id: id,
             date: displayDate,
-            filename: "[\(id)]-[\(dateString)].md",
+            filename: filename,
             previewText: "",
             entryType: .text,
             videoFilename: nil
         )
     }
 
-    static func createVideoEntry() -> HumanEntry {
+    static func createVideoEntry(in directory: URL) -> HumanEntry {
         let id = UUID()
         let now = Date()
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "yyyy-MM-dd"
         let dateString = dateFormatter.string(from: now)
+
+        var baseName = "\(dateString)-video"
+        var counter = 2
+        while FileManager.default.fileExists(atPath: directory.appendingPathComponent("\(baseName).md").path) {
+            baseName = "\(dateString)-video-\(counter)"
+            counter += 1
+        }
 
         // For display
         dateFormatter.dateFormat = "MMM d"
         let displayDate = dateFormatter.string(from: now)
 
-        let videoFilename = "[\(id)]-[\(dateString)].mov"
-
         return HumanEntry(
             id: id,
             date: displayDate,
-            filename: "[\(id)]-[\(dateString)].md",
+            filename: "\(baseName).md",
             previewText: "Video Entry",
             entryType: .video,
-            videoFilename: videoFilename
+            videoFilename: "\(baseName).mov"
         )
     }
 }
@@ -76,6 +91,8 @@ struct HeartEmoji: Identifiable {
 }
 
 struct ContentView: View {
+    private static let defaultDirectoryPath = NSString("~/Documents/Freewrite").expandingTildeInPath
+
     private struct VideoPermissionPopoverItem: Identifiable {
         let id = UUID()
         let message: String
@@ -83,6 +100,7 @@ struct ContentView: View {
         let settingsPane: String
     }
 
+    @State private var documentsDirectory: URL
     @State private var entries: [HumanEntry] = []
     @State private var text: String = ""  // Remove initial welcome text since we'll handle it in createNewEntry
     
@@ -158,39 +176,9 @@ struct ContentView: View {
     private let fileManager = FileManager.default
     private let saveTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     
-    // Add cached documents directory
-    private let documentsDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Freewrite")
-        
-        // Create Freewrite directory if it doesn't exist
-        if !FileManager.default.fileExists(atPath: directory.path) {
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                print("Successfully created Freewrite directory")
-            } catch {
-                print("Error creating directory: \(error)")
-            }
-        }
-        
-        return directory
-    }()
-
-    private let videosDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Freewrite")
-            .appendingPathComponent("Videos")
-
-        if !FileManager.default.fileExists(atPath: directory.path) {
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                print("Successfully created Freewrite/Videos directory")
-            } catch {
-                print("Error creating videos directory: \(error)")
-            }
-        }
-
-        return directory
-    }()
+    private var videosDirectory: URL {
+        documentsDirectory.appendingPathComponent("Videos")
+    }
 
     private let thumbnailMemoryCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
@@ -230,6 +218,11 @@ struct ContentView: View {
         // Load saved color scheme preference
         let savedScheme = UserDefaults.standard.string(forKey: "colorScheme") ?? "light"
         _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
+
+        // Load saved journal directory, falling back to ~/Documents/Freewrite
+        let path = UserDefaults.standard.string(forKey: "journalDirectory")
+            ?? ContentView.defaultDirectoryPath
+        _documentsDirectory = State(initialValue: URL(fileURLWithPath: path))
     }
     
     // Modify getDocumentsDirectory to use cached value
@@ -239,6 +232,19 @@ struct ContentView: View {
 
     private func getVideosDirectory() -> URL {
         return videosDirectory
+    }
+
+    private func ensureDirectoriesExist() {
+        for dir in [documentsDirectory, videosDirectory] {
+            if !fileManager.fileExists(atPath: dir.path) {
+                do {
+                    try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+                    print("Created directory: \(dir.path)")
+                } catch {
+                    print("Error creating directory \(dir.path): \(error)")
+                }
+            }
+        }
     }
 
     private func getVideoEntryDirectory(for videoFilename: String) -> URL {
@@ -466,35 +472,45 @@ struct ContentView: View {
         }
     }
     
-    private func parseCanonicalEntryFilename(_ filename: String) -> (uuid: UUID, timestamp: Date)? {
-        guard filename.hasPrefix("["),
-              filename.hasSuffix("].md"),
-              let divider = filename.range(of: "]-[") else {
-            return nil
+    private func parseEntryFilename(_ filename: String) -> (uuid: UUID, timestamp: Date)? {
+        guard filename.hasSuffix(".md") else { return nil }
+
+        // New format: yyyy-MM-dd*.md (e.g. 2026-04-07-craftsmen.md)
+        let stem = String(filename.dropLast(3))
+        if stem.count >= 10 {
+            let datePrefix = String(stem.prefix(10))
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd"
+            if let timestamp = formatter.date(from: datePrefix) {
+                return (uuid: UUID(), timestamp: timestamp)
+            }
         }
 
-        let uuidStart = filename.index(after: filename.startIndex)
-        let uuidString = String(filename[uuidStart..<divider.lowerBound])
-        guard let uuid = UUID(uuidString: uuidString) else {
-            return nil
+        // Legacy format: [UUID]-[yyyy-MM-dd-HH-mm-ss].md
+        if filename.hasPrefix("["),
+           filename.hasSuffix("].md"),
+           let divider = filename.range(of: "]-[") {
+            let uuidStart = filename.index(after: filename.startIndex)
+            let uuidString = String(filename[uuidStart..<divider.lowerBound])
+            guard let uuid = UUID(uuidString: uuidString) else { return nil }
+
+            let timestampStart = divider.upperBound
+            let timestampEnd = filename.index(filename.endIndex, offsetBy: -4)
+            let timestampString = String(filename[timestampStart..<timestampEnd])
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+            guard let timestamp = formatter.date(from: timestampString) else { return nil }
+            return (uuid: uuid, timestamp: timestamp)
         }
 
-        let timestampStart = divider.upperBound
-        let timestampEnd = filename.index(filename.endIndex, offsetBy: -4) // before ".md"
-        let timestampString = String(filename[timestampStart..<timestampEnd])
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
-        guard let timestamp = formatter.date(from: timestampString) else {
-            return nil
-        }
-
-        return (uuid: uuid, timestamp: timestamp)
+        return nil
     }
     
     private func isEntryNewer(_ lhs: HumanEntry, than rhs: HumanEntry) -> Bool {
-        let lhsTimestamp = parseCanonicalEntryFilename(lhs.filename)?.timestamp ?? .distantPast
-        let rhsTimestamp = parseCanonicalEntryFilename(rhs.filename)?.timestamp ?? .distantPast
+        let lhsTimestamp = parseEntryFilename(lhs.filename)?.timestamp ?? .distantPast
+        let rhsTimestamp = parseEntryFilename(rhs.filename)?.timestamp ?? .distantPast
         if lhsTimestamp == rhsTimestamp {
             return lhs.filename > rhs.filename
         }
@@ -502,7 +518,7 @@ struct ContentView: View {
     }
     
     private func isEntryFromToday(_ entry: HumanEntry, calendar: Calendar = .current, today: Date = Date()) -> Bool {
-        guard let timestamp = parseCanonicalEntryFilename(entry.filename)?.timestamp else {
+        guard let timestamp = parseEntryFilename(entry.filename)?.timestamp else {
             return false
         }
         return calendar.isDate(timestamp, inSameDayAs: today)
@@ -561,9 +577,9 @@ struct ContentView: View {
                 let filename = fileURL.lastPathComponent
                 print("Processing: \(filename)")
 
-                // Only accept canonical entry filenames: [UUID]-[yyyy-MM-dd-HH-mm-ss].md
-                guard let parsed = parseCanonicalEntryFilename(filename) else {
-                    print("Skipping non-canonical entry filename: \(filename)")
+                // Accept yyyy-MM-dd*.md and legacy [UUID]-[yyyy-MM-dd-HH-mm-ss].md
+                guard let parsed = parseEntryFilename(filename) else {
+                    print("Skipping unrecognized entry filename: \(filename)")
                     return nil
                 }
                 let uuid = parsed.uuid
@@ -575,7 +591,8 @@ struct ContentView: View {
 
                 // Read file contents for preview
                 do {
-                    let content = try String(contentsOf: fileURL, encoding: .utf8)
+                    let rawContent = try String(contentsOf: fileURL, encoding: .utf8)
+                    let content = stripFrontmatter(rawContent)
                     let preview = content
                         .replacingOccurrences(of: "\n", with: " ")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1511,7 +1528,19 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     // Header
                     Button(action: {
-                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: getDocumentsDirectory().path)
+                        let panel = NSOpenPanel()
+                        panel.title = "Choose Journal Directory"
+                        panel.canChooseDirectories = true
+                        panel.canChooseFiles = false
+                        panel.allowsMultipleSelection = false
+                        panel.directoryURL = documentsDirectory
+
+                        if panel.runModal() == .OK, let selectedURL = panel.url {
+                            documentsDirectory = selectedURL
+                            UserDefaults.standard.set(selectedURL.path, forKey: "journalDirectory")
+                            ensureDirectoriesExist()
+                            loadExistingEntries()
+                        }
                     }) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
@@ -1709,6 +1738,7 @@ struct ContentView: View {
         .preferredColorScheme(colorScheme)
         .onAppear {
             showingSidebar = false  // Hide sidebar by default
+            ensureDirectoriesExist()
             loadExistingEntries()
         }
         .onChange(of: showingVideoRecording) { _, isShowing in
@@ -1767,12 +1797,13 @@ struct ContentView: View {
         let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
         
         do {
-            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            let rawContent = try String(contentsOf: fileURL, encoding: .utf8)
+            let content = stripFrontmatter(rawContent)
             let preview = content
                 .replacingOccurrences(of: "\n", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let truncated = preview.isEmpty ? "" : (preview.count > 30 ? String(preview.prefix(30)) + "..." : preview)
-            
+
             // Find and update the entry in the entries array
             if let index = entries.firstIndex(where: { $0.id == entry.id }) {
                 entries[index].previewText = truncated
@@ -1787,16 +1818,89 @@ struct ContentView: View {
             return
         }
 
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
-        
+        let dir = getDocumentsDirectory()
+        var filename = entry.filename
+
+        // Keep filename in sync with the first line of content
+        if let slug = generateSlug(from: text) {
+            let datePrefix = String(filename.dropLast(3).prefix(10))
+            let newFilename = "\(datePrefix)-\(slug).md"
+
+            if newFilename != filename {
+                let oldURL = dir.appendingPathComponent(filename)
+                let newURL = dir.appendingPathComponent(newFilename)
+                if fileManager.fileExists(atPath: oldURL.path) {
+                    try? fileManager.removeItem(at: oldURL)
+                }
+                filename = newFilename
+                if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+                    entries[index].filename = newFilename
+                }
+                print("Renamed entry: \(entry.filename) -> \(newFilename)")
+            }
+        }
+
+        // Build frontmatter
+        let datePrefix = String(filename.dropLast(3).prefix(10))
+        let title = slugFromFilename(filename) ?? "untitled"
+        let frontmatter = "---\ntitle: \"\(title)\"\ndate: \(datePrefix)\ntype: journal\n---\n\n"
+
+        let fileURL = dir.appendingPathComponent(filename)
         do {
-            try text.write(to: fileURL, atomically: true, encoding: .utf8)
-            print("Successfully saved entry: \(entry.filename)")
-            updatePreviewText(for: entry)  // Update preview after saving
+            try (frontmatter + text).write(to: fileURL, atomically: true, encoding: .utf8)
+            print("Successfully saved entry: \(filename)")
+            if let current = entries.first(where: { $0.id == entry.id }) {
+                updatePreviewText(for: current)
+            }
         } catch {
             print("Error saving entry: \(error)")
         }
+    }
+
+    private func stripFrontmatter(_ content: String) -> String {
+        guard content.hasPrefix("---\n") || content.hasPrefix("---\r\n") else { return content }
+        let searchStart = content.index(content.startIndex, offsetBy: 4)
+        if let endRange = content.range(of: "\n---\n", range: searchStart..<content.endIndex) {
+            return String(content[endRange.upperBound...])
+        }
+        return content
+    }
+
+    private func slugFromFilename(_ filename: String) -> String? {
+        guard filename.hasSuffix(".md") else { return nil }
+        let stem = String(filename.dropLast(3))
+        guard stem.count > 10 else { return nil }
+        let afterDate = String(stem.dropFirst(10))
+        guard afterDate.hasPrefix("-") else { return nil }
+        let slug = String(afterDate.dropFirst())
+        if slug.isEmpty || slug.range(of: #"^\d+$"#, options: .regularExpression) != nil { return nil }
+        return slug
+    }
+
+    private func filenameNeedsSlug(_ filename: String) -> Bool {
+        return slugFromFilename(filename) == nil
+    }
+
+    private func generateSlug(from content: String) -> String? {
+        // Wait until the user has pressed enter (finished the first line)
+        guard content.contains("\n") else { return nil }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Use only the first line as the title
+        let firstLine = trimmed
+            .components(separatedBy: .newlines)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !firstLine.isEmpty else { return nil }
+
+        let words = firstLine
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .map { $0.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).lowercased() }
+            .filter { !$0.isEmpty }
+
+        guard !words.isEmpty else { return nil }
+        return words.joined(separator: "-")
     }
     
     private func loadEntry(entry: HumanEntry) {
@@ -1827,8 +1931,8 @@ struct ContentView: View {
             do {
                 if fileManager.fileExists(atPath: fileURL.path) {
                     let rawText = try String(contentsOf: fileURL, encoding: .utf8)
-                    // Strip legacy leading newlines from older entries
-                    text = String(rawText.drop(while: { $0 == "\n" }))
+                    // Strip frontmatter and legacy leading newlines
+                    text = stripFrontmatter(rawText).drop(while: { $0 == "\n" }).description
                     print("Successfully loaded entry: \(entry.filename)")
                 }
             } catch {
@@ -1838,7 +1942,7 @@ struct ContentView: View {
     }
     
     private func createNewEntry() {
-        let newEntry = HumanEntry.createNew()
+        let newEntry = HumanEntry.createNew(in: getDocumentsDirectory())
         entries.insert(newEntry, at: 0) // Add to the beginning
         selectedEntryId = newEntry.id
         currentVideoURL = nil
@@ -1926,7 +2030,7 @@ struct ContentView: View {
                 videoFilename: videoFilename
             )
         } else {
-            let newEntry = HumanEntry.createVideoEntry()
+            let newEntry = HumanEntry.createVideoEntry(in: getDocumentsDirectory())
             videoEntry = HumanEntry(
                 id: newEntry.id,
                 date: newEntry.date,
